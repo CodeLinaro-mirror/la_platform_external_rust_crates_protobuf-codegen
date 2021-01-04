@@ -12,7 +12,7 @@
 //! * `protoc-rust` crate (codegen which depends on `protoc` binary for parsing)
 //! * `protobuf-codegen-pure` crate
 
-#![deny(intra_doc_link_resolution_failure)]
+#![deny(broken_intra_doc_links)]
 #![deny(missing_docs)]
 
 extern crate protobuf;
@@ -61,10 +61,18 @@ use self::code_writer::CodeWriter;
 use self::enums::*;
 use self::extensions::*;
 use self::message::*;
-use file::proto_path_to_rust_mod;
 use inside::protobuf_crate_path;
 use scope::FileScope;
 use scope::RootScope;
+
+use crate::file::proto_path_to_rust_mod;
+
+#[doc(hidden)]
+pub use protobuf_name::ProtobufAbsolutePath;
+#[doc(hidden)]
+pub use protobuf_name::ProtobufIdent;
+#[doc(hidden)]
+pub use protobuf_name::ProtobufRelativePath;
 
 fn escape_byte(s: &mut String, b: u8) {
     if b == b'\n' {
@@ -120,24 +128,33 @@ fn write_file_descriptor_data(
     });
     w.write_line("\";");
     w.write_line("");
-    w.lazy_static_protobuf_path(
+    w.lazy_static(
         "file_descriptor_proto_lazy",
         &format!(
             "{}::descriptor::FileDescriptorProto",
             protobuf_crate_path(customize)
         ),
-        protobuf_crate_path(customize),
+        customize,
     );
     w.write_line("");
     w.def_fn(
-        "parse_descriptor_proto() -> ::protobuf::descriptor::FileDescriptorProto",
+        &format!(
+            "parse_descriptor_proto() -> {}::descriptor::FileDescriptorProto",
+            protobuf_crate_path(customize)
+        ),
         |w| {
-            w.write_line("::protobuf::parse_from_bytes(file_descriptor_proto_data).unwrap()");
+            w.write_line(&format!(
+                "{}::parse_from_bytes(file_descriptor_proto_data).unwrap()",
+                protobuf_crate_path(customize)
+            ));
         },
     );
     w.write_line("");
     w.pub_fn(
-        "file_descriptor_proto() -> &'static ::protobuf::descriptor::FileDescriptorProto",
+        &format!(
+            "file_descriptor_proto() -> &'static {}::descriptor::FileDescriptorProto",
+            protobuf_crate_path(customize)
+        ),
         |w| {
             w.block("file_descriptor_proto_lazy.get(|| {", "})", |w| {
                 w.write_line("parse_descriptor_proto()");
@@ -146,12 +163,17 @@ fn write_file_descriptor_data(
     );
 }
 
+struct GenFileResult {
+    compiler_plugin_result: compiler_plugin::GenResult,
+    mod_name: String,
+}
+
 fn gen_file(
     file: &FileDescriptorProto,
     _files_map: &HashMap<&str, &FileDescriptorProto>,
     root_scope: &RootScope,
     customize: &Customize,
-) -> Option<compiler_plugin::GenResult> {
+) -> GenFileResult {
     // TODO: use it
     let mut customize = customize.clone();
     // options specified in invocation have precedence over options specified in file
@@ -170,9 +192,7 @@ fn gen_file(
     {
         let mut w = CodeWriter::new(&mut v);
 
-        // Hack: hard code version number here because Android.bp
-        // rust modules cannot pass it though env variable yet.
-        w.write_generated_by("rust-protobuf", "2.16.2");
+        w.write_generated_by("rust-protobuf", "2.18.0");
         w.write_line(&format!("//! Generated file from `{}`", file.get_name()));
         if customize.inside_protobuf != Some(true) {
             w.write_line("");
@@ -207,10 +227,28 @@ fn gen_file(
         }
     }
 
-    Some(compiler_plugin::GenResult {
-        name: format!("{}.rs", proto_path_to_rust_mod(file.get_name())),
+    GenFileResult {
+        compiler_plugin_result: compiler_plugin::GenResult {
+            name: format!("{}.rs", proto_path_to_rust_mod(file.get_name())),
+            content: v,
+        },
+        mod_name: proto_path_to_rust_mod(file.get_name()).into_string(),
+    }
+}
+
+fn gen_mod_rs(mods: &[String]) -> compiler_plugin::GenResult {
+    let mut v = Vec::new();
+    let mut w = CodeWriter::new(&mut v);
+    w.comment("@generated");
+    w.write_line("");
+    for m in mods {
+        w.write_line(&format!("pub mod {};", m));
+    }
+    drop(w);
+    compiler_plugin::GenResult {
+        name: "mod.rs".to_owned(),
         content: v,
-    })
+    }
 }
 
 // This function is also used externally by cargo plugin
@@ -232,13 +270,23 @@ pub fn gen(
 
     let all_file_names: Vec<&str> = file_descriptors.iter().map(|f| f.get_name()).collect();
 
+    let mut mods = Vec::new();
+
     for file_name in files_to_generate {
         let file = files_map.get(&file_name[..]).expect(&format!(
             "file not found in file descriptors: {:?}, files: {:?}",
             file_name, all_file_names
         ));
-        results.extend(gen_file(file, &files_map, &root_scope, customize));
+
+        let gen_file_result = gen_file(file, &files_map, &root_scope, customize);
+        results.push(gen_file_result.compiler_plugin_result);
+        mods.push(gen_file_result.mod_name);
     }
+
+    if customize.gen_mod_rs.unwrap_or(false) {
+        results.push(gen_mod_rs(&mods));
+    }
+
     results
 }
 
@@ -268,4 +316,10 @@ pub fn protoc_gen_rust_main() {
         let customize = Customize::parse_from_parameter(r.parameter).expect("parse options");
         gen(r.file_descriptors, r.files_to_generate, &customize)
     });
+}
+
+/// Used in protobuf-codegen-identical-test
+#[doc(hidden)]
+pub fn proto_name_to_rs(name: &str) -> String {
+    format!("{}.rs", proto_path_to_rust_mod(name))
 }
